@@ -93,7 +93,8 @@
         o
         (util/expected "double" code (rawIn/getBytesRead (.-raw-in rdr)) o)))))
 
-(defn internalReadInt
+(declare internalReadInt)
+(defn internalReadInt-cond
   [rdr code]
   (cond
     (== code 0xFF) -1
@@ -174,7 +175,7 @@
           (util/expected "chunked string" code (rawIn/getBytesRead (.-raw-in rdr))))))
     (.toString sb)))
 
-(defn internalRead [rdr code]
+(defn internalRead-cond [rdr code]
   (cond
     ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
     ;; primitives
@@ -295,6 +296,80 @@
 
     :else
     (throw (ex-info (str "unmatched code: " code) {:code code}))))
+
+
+;; E9: code -> reader fn, decided once per code byte. The `cond` above answers
+;; each read through up to ~40 generic `==`/variadic `<=` comparisons
+;; (jolt-num-equiv, apply/list-length/exists on Jolt); this is one vector nth.
+(defn- int-reader [c]
+  (cond
+    (== c 0xFF) (fn [_] -1)
+    (<= 0x00 c 0x3F) (let [v (bit-and c 0xFF)] (fn [_] v))
+    (<= 0x40 c 0x5F) (let [hi (bit-shift-left (- c codes/INT_PACKED_2_ZERO) 8)] (fn [rdr] (bit-or hi (rawIn/readRawInt8 (.-raw-in rdr)))))
+    (<= 0x60 c 0x6F) (let [hi (bit-shift-left (- c codes/INT_PACKED_3_ZERO) 16)] (fn [rdr] (bit-or hi (rawIn/readRawInt16 (.-raw-in rdr)))))
+    (<= 0x70 c 0x73) (let [hi (bit-shift-left (- c codes/INT_PACKED_4_ZERO) 24)] (fn [rdr] (bit-or hi (rawIn/readRawInt24 (.-raw-in rdr)))))
+    (<= 0x74 c 0x77) (let [hi (bit-shift-left (- c codes/INT_PACKED_5_ZERO) 32)] (fn [rdr] (bit-or hi (rawIn/readRawInt32 (.-raw-in rdr)))))
+    (<= 0x78 c 0x7B) (let [hi (bit-shift-left (- c codes/INT_PACKED_6_ZERO) 40)] (fn [rdr] (bit-or hi (rawIn/readRawInt40 (.-raw-in rdr)))))
+    (<= 0x7C c 0x7F) (let [hi (bit-shift-left (- c codes/INT_PACKED_7_ZERO) 48)] (fn [rdr] (bit-or hi (rawIn/readRawInt48 (.-raw-in rdr)))))
+    (== c codes/INT) (fn [rdr] (rawIn/readRawInt64 (.-raw-in rdr)))))
+
+(def ^:private int-dispatch (mapv int-reader (range 256)))
+
+(defn- code-reader [c]
+  (cond
+    (or (== c 0xFF) (<= 0x00 c 0x7F) (== c codes/INT))
+    (let [f (nth int-dispatch c)] (fn [rdr _] (f rdr)))
+    (<= codes/STRING_PACKED_LENGTH_START c (dec codes/STRING_PACKED_LENGTH_END))
+    (let [n (- c codes/STRING_PACKED_LENGTH_START)] (fn [rdr _] (internalReadString rdr n)))
+    (<= codes/LIST_PACKED_LENGTH_START c (dec codes/LIST_PACKED_LENGTH_END))
+    (let [n (- c codes/LIST_PACKED_LENGTH_START)] (fn [rdr _] (internalReadList rdr n)))
+    (<= codes/PRIORITY_CACHE_PACKED_START c (dec codes/PRIORITY_CACHE_PACKED_END))
+    (let [n (- c codes/PRIORITY_CACHE_PACKED_START)] (fn [rdr _] (lookupCache rdr (getPriorityCache- rdr) n)))
+    (<= codes/STRUCT_CACHE_PACKED_START c (dec codes/STRUCT_CACHE_PACKED_END))
+    (let [n (- c codes/STRUCT_CACHE_PACKED_START)]
+      (fn [rdr _] (let [st (lookupCache rdr (getStructCache- rdr) n)]
+                    (handleStruct- rdr (.-tag ^StructType st) (.-fields ^StructType st)))))
+    (== c codes/TRUE) (fn [_ _] true)
+    (== c codes/FALSE) (fn [_ _] false)
+    (== c codes/NULL) (fn [_ _] nil)
+    (== c codes/UTF8) (fn [rdr _] (readUTF8 rdr))
+    (#{codes/DOUBLE codes/DOUBLE_0 codes/DOUBLE_1} c) (fn [rdr c] (internalReadDouble rdr c))
+    (== c codes/FLOAT) (fn [rdr _] (rawIn/readRawFloat (.-raw-in rdr)))
+    (<= codes/BYTES_PACKED_LENGTH_START c (dec codes/BYTES_PACKED_LENGTH_END))
+    (let [n (- c codes/BYTES_PACKED_LENGTH_START)] (fn [rdr _] (internalReadBytes rdr n)))
+    (== c codes/BYTES) (fn [rdr _] (internalReadBytes rdr (readCount- rdr)))
+    (== c codes/STRING) (fn [rdr _] (internalReadString rdr (readCount- rdr)))
+    (== c codes/LIST) (fn [rdr _] (internalReadList rdr (readCount- rdr)))
+    (== c codes/MAP) (fn [rdr _] (handleStruct- rdr "map" 1))
+    (== c codes/SET) (fn [rdr _] (handleStruct- rdr "set" 1))
+    (== c codes/_UUID) (fn [rdr _] (handleStruct- rdr "uuid" 2))
+    (== c codes/INST) (fn [rdr _] (handleStruct- rdr "inst" 1))
+    (== c codes/SYM) (fn [rdr _] (handleStruct- rdr "sym" 2))
+    (== c codes/KEY) (fn [rdr _] (handleStruct- rdr "key" 2))
+    (== c codes/BIGINT) (fn [rdr _] (handleStruct- rdr "bigint" 1))
+    (== c codes/PUT_PRIORITY_CACHE) (fn [rdr _] (readAndCacheObject- rdr (getPriorityCache- rdr)))
+    (== c codes/GET_PRIORITY_CACHE) (fn [rdr _] (lookupCache rdr (getPriorityCache- rdr) (readInt32 rdr)))
+    (== c codes/STRUCTTYPE)
+    (fn [rdr _] (let [tag (readObject rdr) n-fields (readInt32 rdr)]
+                  (.add ^java.util.ArrayList (getStructCache- rdr) (StructType. tag n-fields))
+                  (handleStruct- rdr tag n-fields)))
+    (== c codes/STRUCT)
+    (fn [rdr _] (let [st (lookupCache rdr (getStructCache- rdr) (readInt32 rdr))]
+                  (handleStruct- rdr (.-tag ^StructType st) (.-fields ^StructType st))))
+    (== c codes/BEGIN_CLOSED_LIST) (fn [rdr _] ((getHandler- rdr "list") (readClosedList rdr)))
+    (== c codes/BEGIN_OPEN_LIST) (fn [rdr _] ((getHandler- rdr "list") (readOpenList rdr)))
+    (== c codes/RESET_CACHES) (fn [rdr _] (resetCaches rdr) (readObject rdr))
+    :else internalRead-cond))
+
+(def ^:private code-dispatch (mapv code-reader (range 256)))
+
+(defn internalRead [rdr code] ((nth code-dispatch code) rdr code))
+
+(defn internalReadInt [rdr code]
+  (if-let [f (nth int-dispatch code)]
+    (f rdr)
+    (let [o (read- rdr code)]
+      (if (number? o) o (util/expected "i64" code (rawIn/getBytesRead (.-raw-in rdr)) o)))))
 
 (def UNDER_CONSTRUCTION (Object.))
 
@@ -535,11 +610,14 @@
   (let [handlers (if (empty? user-handlers)
                    default-read-handlers
                    (table/add-handlers (table/from-table default-read-handlers) user-handlers))]
-    (fn lookup [_rdr tag]
-      (if (= "record" tag)
-        (or (table/?get handlers "record")
-            (fn [rdr tag field-count] (readRecord rdr tag field-count name->map-ctor)))
-        (table/?get handlers tag)))))
+    ;; E9: one hash map built here, instead of a linear `=` scan of the flat
+    ;; [tag handler ...] table per struct read (which also compared the tag
+    ;; against every handler fn, off jolt=2's fast paths).
+    (let [m (into {} (map vec) (partition 2 (table/entries handlers)))
+          record-h (or (get m "record")
+                       (fn [rdr tag field-count] (readRecord rdr tag field-count name->map-ctor)))]
+      (fn lookup [_rdr tag]
+        (if (= "record" tag) record-h (get m tag))))))
 
 (defn valid-handler-key?
   [k]
