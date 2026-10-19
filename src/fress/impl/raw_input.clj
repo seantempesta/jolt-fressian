@@ -112,9 +112,41 @@
           (throw (ex-info (str "Invalid footer checksum, expected " calculated " got " received)
                            {:expected calculated :got received})))))))
 
+(defn- eof! [] (throw (ex-info "EOF" {})))
+
+;; E9: a byte-array RawInput with no checksum. Each read is an aget on the
+;; backing array plus one mutable position, instead of RawInput -> BufferReader
+;; protocol calls (and a set! of bytesRead) for every byte.
+(deftype ArrayRawInput [^bytes arr ^long off ^long end ^:unsynchronized-mutable ^long pos]
+  IRawInput
+  (getBytesRead [_this] (- pos off))
+  (readRawByte [_this]
+    (if (< pos end)
+      (let [b (bit-and (aget arr pos) 0xFF)] (set! pos (inc pos)) b)
+      (eof!)))
+  (readFully [_this length]
+    (let [p pos e (+ p length)]
+      (when (> e end) (eof!))
+      (set! pos e)
+      (java.util.Arrays/copyOfRange arr p e)))
+  (reset [_this] (set! pos off))
+  (close [_this] nil)
+  (readRawInt8 [this] (readRawByte this))
+  (readRawInt16 [this] (read-unsigned-msb this 2))
+  (readRawInt24 [this] (read-unsigned-msb this 3))
+  (readRawInt32 [this] (read-unsigned-msb this 4))
+  (readRawInt40 [this] (read-unsigned-msb this 5))
+  (readRawInt48 [this] (read-unsigned-msb this 6))
+  (readRawInt64 [this] (read-unsigned-msb this 8))
+  (readRawFloat [this] (bits->float (read-unsigned-msb this 4)))
+  (readRawDouble [this] (bits->double (read-unsigned-msb this 8)))
+  (validateChecksum [this] (read-unsigned-msb this 4)))
+
 (defn raw-input
   ([in] (raw-input in 0))
   ([in start-index] (raw-input in start-index true))
   ([in start-index validate-adler?]
-   (let [in (buf/readable-buffer in start-index)]
-     (RawInput. in (when validate-adler? (adler/adler32))))))
+   (if (and (not validate-adler?) (bytes? in))
+     (ArrayRawInput. in start-index (alength ^bytes in) start-index)
+     (let [in (buf/readable-buffer in start-index)]
+       (RawInput. in (when validate-adler? (adler/adler32)))))))
